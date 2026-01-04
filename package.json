@@ -1,0 +1,26 @@
+{
+  "name": "audviz-g52",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "services/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "npm-run-all -p dev:brain dev:asset-gen dev:visualizer",
+    "dev:brain": "npm --workspace @audviz/brain run dev",
+    "dev:asset-gen": "npm --workspace @audviz/asset-gen run dev",
+    "dev:visualizer": "npm --workspace @audviz/visualizer run dev",
+    "kill:ports": "node scripts/kill-ports.mjs",
+    "build": "npm-run-all -s build:visualizer",
+    "build:visualizer": "npm --workspace @audviz/visualizer run build",
+    "typecheck": "npm-run-all -s typecheck:brain typecheck:asset-gen typecheck:visualizer",
+    "typecheck:brain": "npm --workspace @audviz/brain run typecheck",
+    "typecheck:asset-gen": "npm --workspace @audviz/asset-gen run typecheck",
+    "typecheck:visualizer": "npm --workspace @audviz/visualizer run typecheck"
+  },
+  "devDependencies": {
+    "npm-run-all": "^4.1.5",
+    "typescript": "^5.5.4"
+  }
+}

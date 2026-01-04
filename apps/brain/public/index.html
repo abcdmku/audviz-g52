@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>audviz brain (capture)</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #0b0d12;
+        --panel: #121622;
+        --panel2: #0f1320;
+        --text: #e7eaf0;
+        --muted: #a9b1c6;
+        --accent: #7c5cff;
+        --accent2: #00d4ff;
+        --danger: #ff4d6d;
+        --border: #242b3e;
+      }
+      html,
+      body {
+        height: 100%;
+        margin: 0;
+        background: radial-gradient(1200px 800px at 20% 10%, #1a1335 0%, transparent 60%),
+          radial-gradient(1000px 800px at 80% 0%, #0d2a3a 0%, transparent 55%),
+          var(--bg);
+        color: var(--text);
+        font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto,
+          Ubuntu, Cantarell, Noto Sans, Helvetica, Arial;
+      }
+      .wrap {
+        max-width: 980px;
+        margin: 0 auto;
+        padding: 20px 16px 40px;
+      }
+      .top {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 16px;
+        margin-bottom: 14px;
+      }
+      h1 {
+        margin: 0;
+        font-size: 20px;
+        font-weight: 650;
+        letter-spacing: 0.2px;
+      }
+      .subtitle {
+        color: var(--muted);
+        font-size: 13px;
+      }
+      .grid {
+        display: grid;
+        grid-template-columns: 1.2fr 0.8fr;
+        gap: 12px;
+      }
+      @media (max-width: 900px) {
+        .grid {
+          grid-template-columns: 1fr;
+        }
+      }
+      .card {
+        background: linear-gradient(180deg, rgba(255, 255, 255, 0.04), transparent 80%),
+          var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 14px;
+        padding: 14px;
+      }
+      .row {
+        display: flex;
+        gap: 10px;
+        flex-wrap: wrap;
+        align-items: center;
+      }
+      label {
+        display: block;
+        font-size: 12px;
+        color: var(--muted);
+        margin-bottom: 6px;
+      }
+      select,
+      button,
+      input[type="checkbox"] {
+        font: inherit;
+      }
+      select {
+        width: 100%;
+        background: var(--panel2);
+        border: 1px solid var(--border);
+        color: var(--text);
+        padding: 10px 12px;
+        border-radius: 12px;
+      }
+      button {
+        background: linear-gradient(180deg, rgba(255, 255, 255, 0.12), transparent),
+          rgba(124, 92, 255, 0.24);
+        border: 1px solid rgba(124, 92, 255, 0.55);
+        color: var(--text);
+        padding: 10px 12px;
+        border-radius: 12px;
+        cursor: pointer;
+      }
+      button.secondary {
+        background: rgba(255, 255, 255, 0.04);
+        border: 1px solid var(--border);
+      }
+      button.danger {
+        background: rgba(255, 77, 109, 0.18);
+        border: 1px solid rgba(255, 77, 109, 0.5);
+      }
+      button:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+      }
+      .meter {
+        width: 100%;
+        height: 12px;
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.06);
+        border: 1px solid var(--border);
+        overflow: hidden;
+      }
+      .meter > div {
+        height: 100%;
+        width: 0%;
+        background: linear-gradient(90deg, var(--accent2), var(--accent));
+        transition: width 60ms linear;
+      }
+      .kv {
+        display: grid;
+        grid-template-columns: 120px 1fr;
+        row-gap: 6px;
+        column-gap: 10px;
+        font-size: 13px;
+      }
+      .kv .k {
+        color: var(--muted);
+      }
+      .log {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+          "Liberation Mono", "Courier New", monospace;
+        font-size: 12px;
+        line-height: 1.35;
+        background: rgba(0, 0, 0, 0.25);
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 10px;
+        height: 220px;
+        overflow: auto;
+        white-space: pre-wrap;
+      }
+      .hint {
+        color: var(--muted);
+        font-size: 12px;
+        margin-top: 10px;
+      }
+      .pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 12px;
+        color: var(--muted);
+        border: 1px solid var(--border);
+        background: rgba(255, 255, 255, 0.03);
+        border-radius: 999px;
+        padding: 6px 10px;
+      }
+      .dot {
+        width: 10px;
+        height: 10px;
+        border-radius: 999px;
+        background: var(--danger);
+      }
+      .dot.ok {
+        background: #22c55e;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="top">
+        <div>
+          <h1>audviz brain</h1>
+          <div class="subtitle">
+            Captures mic/line-in audio and streams PCM to the local analysis
+            service.
+          </div>
+        </div>
+        <div class="pill">
+          <span class="dot" id="wsDot"></span>
+          <span id="wsText">WS: disconnected</span>
+        </div>
+      </div>
+
+      <div class="grid">
+        <div class="card">
+          <div class="row" style="justify-content: space-between">
+            <div style="flex: 1; min-width: 260px">
+              <label for="deviceSelect">Audio input device</label>
+              <select id="deviceSelect"></select>
+            </div>
+            <div style="display: flex; gap: 10px; align-items: end">
+              <button class="secondary" id="refreshDevices">
+                Refresh devices
+              </button>
+              <button id="startBtn">Start capture</button>
+              <button class="danger" id="stopBtn" disabled>Stop</button>
+            </div>
+          </div>
+
+          <div style="margin-top: 14px">
+            <label>Input level</label>
+            <div class="meter"><div id="levelBar"></div></div>
+            <div class="hint">
+              Tip: disable OS “enhancements” (noise suppression, AGC) for tighter
+              beat tracking.
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="kv">
+            <div class="k">Sample rate</div>
+            <div id="sr">-</div>
+            <div class="k">Frame size</div>
+            <div id="fs">-</div>
+            <div class="k">Sent</div>
+            <div id="sent">-</div>
+            <div class="k">Dropped</div>
+            <div id="dropped">-</div>
+          </div>
+          <div style="margin-top: 12px">
+            <label>Log</label>
+            <div class="log" id="log"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <script type="module" src="/main.js"></script>
+  </body>
+</html>
