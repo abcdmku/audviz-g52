@@ -111,6 +111,13 @@ export class WebGl2Renderer {
   // Nebula morph (vibe-synced fractal shape changes)
   private rngState = 1 >>> 0;
   private lastTime = 0;
+  private dprCap = 2;
+
+  // Beat flow (smooth beat-synced 0..1 wave; used to avoid harsh flashing in nebula mode)
+  private beatClock = 0;
+  private beatPeriod = 0.5;
+  private prevBeatPulseForFlow = 0;
+
   private prevBeat = 0;
   private prevDropPulse = 0;
   private beatCount = 0;
@@ -249,9 +256,20 @@ export class WebGl2Renderer {
   }
 
   render(state: RenderState) {
+    const modeA = this.transitionState?.modeA ?? this.preset?.mode ?? 0;
+    const modeB = this.transitionState?.modeB ?? this.preset?.mode ?? 0;
+    const dropPulse = this.transitionState?.dropPulse ?? 0;
+
+    const nebulaVisible = modeA >= 4.5 || modeB >= 4.5;
+    const desiredDprCap = nebulaVisible ? 1.5 : 2;
+    if (this.dprCap !== desiredDprCap) {
+      this.dprCap = desiredDprCap;
+      this.resizeToClientSize();
+    }
+
     const canvas = this.canvas;
-    const w = Math.max(1, Math.floor(canvas.clientWidth * devicePixelRatio));
-    const h = Math.max(1, Math.floor(canvas.clientHeight * devicePixelRatio));
+    const w = canvas.width;
+    const h = canvas.height;
     if (w <= 1 || h <= 1) return;
 
     const low = avg(state.spectrum, 0, 10);
@@ -259,23 +277,21 @@ export class WebGl2Renderer {
     const high = avg(state.spectrum, 28, 64);
     const intensity = clamp01(state.energy * state.energy * 0.8 + high * 0.35 + mid * 0.15);
 
-    const modeA = this.transitionState?.modeA ?? this.preset?.mode ?? 0;
-    const modeB = this.transitionState?.modeB ?? this.preset?.mode ?? 0;
-    const dropPulse = this.transitionState?.dropPulse ?? 0;
-
     const dt = this.lastTime ? Math.min(0.1, Math.max(0, state.time - this.lastTime)) : 0;
     this.lastTime = state.time;
     const vibe = clamp01(0.55 * intensity + 0.25 * high + 0.2 * clamp01(state.energy));
-    const nebulaVisible = modeA >= 4.5 || modeB >= 4.5;
+    const beatPulse = clamp01(state.beat);
+    const beatFlow = this.updateBeatFlow(dt, state.bpm, beatPulse);
     this.updateNebulaShape({
       time: state.time,
       dt,
       bpm: state.bpm,
-      beat: clamp01(state.beat),
+      beat: beatPulse,
       dropPulse: clamp01(dropPulse),
       vibe,
       nebulaVisible
     });
+    const beatForShader = nebulaVisible ? beatFlow : beatPulse;
 
     const n = Math.min(state.spectrum.length, this.spectrum.length);
     for (let i = 0; i < n; i++) this.spectrum[i] = state.spectrum[i] ?? 0;
@@ -291,7 +307,7 @@ export class WebGl2Renderer {
     gl.uniform1f(this.uTime, state.time);
     gl.uniform1f(this.uBpm, state.bpm);
     gl.uniform1f(this.uEnergy, clamp01(state.energy));
-    gl.uniform1f(this.uBeat, clamp01(state.beat));
+    gl.uniform1f(this.uBeat, beatForShader);
     gl.uniform1f(this.uModeA, modeA);
     gl.uniform1f(this.uModeB, modeB);
     gl.uniform1f(this.uBlend, this.transitionState?.blend ?? 0);
@@ -309,6 +325,34 @@ export class WebGl2Renderer {
 
     gl.viewport(0, 0, w, h);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
+  }
+
+  private updateBeatFlow(dt: number, bpm: number, beatPulse: number) {
+    const onset = beatPulse > 0.85 && this.prevBeatPulseForFlow <= 0.85;
+    this.prevBeatPulseForFlow = beatPulse;
+
+    const bpmPeriod = 60 / Math.max(1, bpm);
+    if (!(this.beatPeriod > 0) || !Number.isFinite(this.beatPeriod)) this.beatPeriod = bpmPeriod;
+
+    if (dt > 0 && Number.isFinite(dt)) this.beatClock += dt;
+
+    if (onset) {
+      const measured = this.beatClock || bpmPeriod;
+      const minP = Math.max(0.15, bpmPeriod * 0.5);
+      const maxP = Math.min(2.5, bpmPeriod * 2.0);
+      const clamped = Math.max(minP, Math.min(maxP, measured));
+      this.beatPeriod = this.beatPeriod * 0.8 + clamped * 0.2;
+      this.beatClock = 0;
+    } else if (dt > 0) {
+      // Slowly drift toward the current BPM estimate when beats are missing.
+      const relax = 1 - Math.exp(-dt * 0.5);
+      this.beatPeriod = this.beatPeriod + (bpmPeriod - this.beatPeriod) * relax;
+    }
+
+    // Cosine wave keeps continuity across phase wrap (no "flash" on reset).
+    const phase = this.beatPeriod > 0 ? this.beatClock / this.beatPeriod : 0;
+    const frac = phase - Math.floor(phase);
+    return clamp01(0.5 + 0.5 * Math.cos(frac * Math.PI * 2));
   }
 
   private rand01() {
@@ -345,7 +389,8 @@ export class WebGl2Renderer {
   }) {
     const { time, dt, bpm, beat, dropPulse, vibe, nebulaVisible } = args;
 
-    const beatsPerChange = Math.max(2, Math.round(6 - vibe * 4));
+    const dropBoost = clamp01(dropPulse);
+    const beatsPerChange = Math.max(1, Math.round(6 - vibe * 4 - dropBoost * 2));
     if (!this.nebulaInitialized) {
       const init = this.randomNebulaTarget(vibe, 0.4);
       this.nebulaFrom.set(init);
@@ -370,19 +415,19 @@ export class WebGl2Renderer {
     this.prevDropPulse = dropPulse;
 
     const sinceLast = time - this.lastNebulaChange;
-    const fallbackInterval = 8 - vibe * 5; // seconds (3..8)
+    const fallbackInterval = (8 - vibe * 5) * (1 - dropBoost * 0.35); // seconds (~2..8)
 
     let trigger = false;
-    let punch = 0.5;
+    let punch = 0.4;
     if (nebulaVisible && dropOnset) {
       trigger = true;
       punch = 1.0;
     } else if (nebulaVisible && beatOnset && this.beatCount >= this.nextNebulaBeat) {
       trigger = true;
-      punch = 0.6 + 0.4 * vibe;
+      punch = 0.35 + 0.45 * vibe + 0.25 * dropBoost;
     } else if (nebulaVisible && sinceLast > fallbackInterval) {
       trigger = true;
-      punch = 0.45 + 0.35 * vibe;
+      punch = 0.3 + 0.35 * vibe + 0.15 * dropBoost;
     }
 
     if (trigger) {
@@ -390,7 +435,8 @@ export class WebGl2Renderer {
       this.nebulaTo.set(this.randomNebulaTarget(vibe, punch));
       this.nebulaMorph = 0;
       const beatSec = 60 / Math.max(1, bpm);
-      this.nebulaMorphDur = Math.max(0.25, beatSec * (1.6 - vibe * 0.7));
+      const baseDur = beatSec * (2.1 - vibe * 0.9);
+      this.nebulaMorphDur = Math.max(0.22, baseDur * (1 - dropBoost * 0.45));
       this.lastNebulaChange = time;
       this.nextNebulaBeat = this.beatCount + beatsPerChange;
     }
@@ -406,8 +452,9 @@ export class WebGl2Renderer {
   }
 
   private resizeToClientSize() {
-    const w = Math.max(1, Math.floor(this.canvas.clientWidth * devicePixelRatio));
-    const h = Math.max(1, Math.floor(this.canvas.clientHeight * devicePixelRatio));
+    const dpr = Math.min(devicePixelRatio, this.dprCap);
+    const w = Math.max(1, Math.floor(this.canvas.clientWidth * dpr));
+    const h = Math.max(1, Math.floor(this.canvas.clientHeight * dpr));
     if (this.canvas.width === w && this.canvas.height === h) return;
     this.canvas.width = w;
     this.canvas.height = h;
@@ -680,28 +727,39 @@ vec3 scene(float mode, vec2 uv, float time, float bpm, float energy, float beat,
   } else {
     // Fractal Nebula (vibe-synced morphing)
     vec4 sh = clamp(uNebula, 0.0, 1.0);
-    float detail = mix(0.85, 1.75, sh.x);
-    float warpMul = mix(0.4, 1.8, sh.y);
+    float detail = mix(0.9, 1.55, sh.x);
+    float warpMul = mix(0.45, 1.65, sh.y);
     float swirl = (sh.z * 2.0 - 1.0) * mix(0.08, 0.35, 0.6 * sh.y + 0.4 * sh.w);
     float structure = sh.w;
     float fold = smoothstep(0.15, 0.85, structure);
     float ridge = smoothstep(0.25, 1.0, structure);
 
-    float speed = (bpm / 60.0) * (0.12 + intensity * 0.4) * (1.0 + 0.25 * sh.y + 0.15 * abs(swirl));
-    float t = time * speed;
-    vec3 q = vec3(uv * (1.1 + energy * 1.9) * detail, t);
+    float beatFlow = beat;
+    float drop = clamp(uDropPulse, 0.0, 1.0);
+    float beatK = beatFlow * 2.0 - 1.0;
+
+    float motionCoef = 0.05 + intensity * 0.25 + drop * 0.22;
+    float baseSpeed = (bpm / 60.0) * motionCoef * (1.0 + 0.2 * sh.y + 0.12 * abs(swirl));
+    float t = time * baseSpeed;
+    float beatOffset = beatFlow * (0.08 + intensity * 0.18 + drop * 0.55);
+    float tb = t + beatOffset;
+    float beatWarp = 1.0 + beatK * (0.06 + intensity * 0.1 + drop * 0.22);
+    float beatZoom = 1.0 + beatK * (0.012 + intensity * 0.03 + drop * 0.05);
+    float beatTwist = beatK * (0.25 + intensity * 0.5 + drop * 0.9);
+
+    vec3 q = vec3(uv * (1.1 + energy * 1.9) * detail * beatZoom, tb);
     q.xy = mix(q.xy, abs(q.xy), fold);
     q = q + vec3(
-        sin(q.y * (1.15 + 0.55 * detail) + t * 0.12 + swirl * 2.2),
-        cos(q.x * (1.05 + 0.5 * detail) - t * 0.1 - swirl * 2.0),
+        sin(q.y * (1.15 + 0.55 * detail) + tb * 0.12 + swirl * 2.2 + beatTwist * 0.9),
+        cos(q.x * (1.05 + 0.5 * detail) - tb * 0.1 - swirl * 2.0 - beatTwist * 0.9),
         0.0
-      ) * (0.3 + intensity * 0.7) * warpMul;
+      ) * (0.24 + intensity * 0.76) * (1.0 + drop * 0.35) * warpMul * beatWarp;
     float acc = 0.0;
     vec3 colAcc = vec3(0.0);
-    for (int i = 0; i < 9; i++) {
+    for (int i = 0; i < 8; i++) {
       float fi = float(i);
       float s = (1.25 + fi * 0.38) * detail;
-      vec2 tt = vec2(t * (0.22 + 0.18 * warpMul), -t * (0.19 + 0.16 * warpMul));
+      vec2 tt = vec2(tb * (0.22 + 0.18 * warpMul), -tb * (0.19 + 0.16 * warpMul));
       float n = noise2(q.xy * s + tt + vec2(structure * 2.7, swirl * 3.1));
       float dCenter = abs(n - 0.5);
       float dEdge = min(n, 1.0 - n);
@@ -709,18 +767,18 @@ vec3 scene(float mode, vec2 uv, float time, float bpm, float energy, float beat,
       float w = exp(-d * (4.0 + high * 6.0 + ridge * 8.0));
       acc += w;
       colAcc += palette(n + fi * 0.06 + structure * 0.12) * w;
-      q.xy = rotate2(q.xy, 0.14 + n * 0.26 + swirl * 0.22);
+      q.xy = rotate2(q.xy, 0.14 + n * 0.26 + swirl * 0.22 + beatK * (0.02 + intensity * 0.05 + drop * 0.08));
       q.xy =
         q.xy +
         vec2(
-          sin(q.y * (0.9 + 0.4 * detail) - t * 0.35),
-          cos(q.x * (0.8 + 0.5 * detail) + t * 0.33)
+          sin(q.y * (0.9 + 0.4 * detail) - tb * 0.35),
+          cos(q.x * (0.8 + 0.5 * detail) + tb * 0.33)
         ) *
           (0.03 + 0.06 * warpMul) *
           (0.35 + 0.65 * ridge);
     }
     col = colAcc / max(0.001, acc);
-    col = col + beat * vec3(0.5, 0.7, 1.0) * (0.2 + intensity);
+    col = col + beatFlow * vec3(0.35, 0.5, 0.8) * (0.05 + 0.11 * intensity + 0.18 * drop);
   }
   return col;
 }
@@ -752,7 +810,7 @@ void main() {
   vec3 col = mix(colA, colB, blend);
 
   float vign = smoothstep(1.1, 0.2, length(uv));
-  col += dropPulse * vign * palette(0.92) * (0.08 + intensity * 0.18);
+  col += dropPulse * vign * palette(0.92) * (0.12 + intensity * 0.24);
 
   col = col * (0.55 + energy * 0.8);
   col = max(col, vec3(0.0));

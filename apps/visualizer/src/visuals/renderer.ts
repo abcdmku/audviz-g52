@@ -40,6 +40,13 @@ export class WebGpuRenderer {
   // Nebula morph (vibe-synced fractal shape changes)
   private rngState = 1 >>> 0;
   private lastTime = 0;
+  private dprCap = 2;
+
+  // Beat flow (smooth beat-synced 0..1 wave; used to avoid harsh flashing in nebula mode)
+  private beatClock = 0;
+  private beatPeriod = 0.5;
+  private prevBeatPulseForFlow = 0;
+
   private prevBeat = 0;
   private prevDropPulse = 0;
   private beatCount = 0;
@@ -195,8 +202,6 @@ export class WebGpuRenderer {
 
   render(state: RenderState) {
     const canvas = this.context.canvas as HTMLCanvasElement;
-    const w = Math.max(1, Math.floor(canvas.clientWidth * devicePixelRatio));
-    const h = Math.max(1, Math.floor(canvas.clientHeight * devicePixelRatio));
 
     // params vec4 packing:
     // v0: (w, h, time, modeA)
@@ -205,13 +210,20 @@ export class WebGpuRenderer {
     // v3: (nebulaShape.x, nebulaShape.y, nebulaShape.z, nebulaShape.w)
     const modeA = this.transitionState?.modeA ?? this.preset?.mode ?? 0;
     const modeB = this.transitionState?.modeB ?? this.preset?.mode ?? 0;
+    const nebulaVisible = modeA >= 4.5 || modeB >= 4.5;
+    const desiredDprCap = nebulaVisible ? 1.5 : 2;
+    if (this.dprCap !== desiredDprCap) {
+      this.dprCap = desiredDprCap;
+      this.resizeToClientSize();
+    }
+    const w = canvas.width;
+    const h = canvas.height;
     this.params[0] = w;
     this.params[1] = h;
     this.params[2] = state.time;
     this.params[3] = modeA;
     this.params[4] = state.bpm;
     this.params[5] = state.energy;
-    this.params[6] = state.beat;
     this.params[7] = modeB;
 
     const low = avg(state.spectrum, 0, 10);
@@ -229,16 +241,19 @@ export class WebGpuRenderer {
     const dt = this.lastTime ? Math.min(0.1, Math.max(0, state.time - this.lastTime)) : 0;
     this.lastTime = state.time;
     const vibe = clamp01(0.55 * intensity + 0.25 * high + 0.2 * clamp01(state.energy));
-    const nebulaVisible = modeA >= 4.5 || modeB >= 4.5;
+    const beatPulse = clamp01(state.beat);
+    const beatFlow = this.updateBeatFlow(dt, state.bpm, beatPulse);
     this.updateNebulaShape({
       time: state.time,
       dt,
       bpm: state.bpm,
-      beat: clamp01(state.beat),
+      beat: beatPulse,
       dropPulse: clamp01(dropPulse),
       vibe,
       nebulaVisible
     });
+    const beatForShader = nebulaVisible ? beatFlow : beatPulse;
+    this.params[6] = beatForShader;
     this.params[12] = this.nebulaShape[0] ?? 0.5;
     this.params[13] = this.nebulaShape[1] ?? 0.5;
     this.params[14] = this.nebulaShape[2] ?? 0.5;
@@ -268,10 +283,39 @@ export class WebGpuRenderer {
     this.device.queue.submit([encoder.finish()]);
   }
 
+  private updateBeatFlow(dt: number, bpm: number, beatPulse: number) {
+    const onset = beatPulse > 0.85 && this.prevBeatPulseForFlow <= 0.85;
+    this.prevBeatPulseForFlow = beatPulse;
+
+    const bpmPeriod = 60 / Math.max(1, bpm);
+    if (!(this.beatPeriod > 0) || !Number.isFinite(this.beatPeriod)) this.beatPeriod = bpmPeriod;
+
+    if (dt > 0 && Number.isFinite(dt)) this.beatClock += dt;
+
+    if (onset) {
+      const measured = this.beatClock || bpmPeriod;
+      const minP = Math.max(0.15, bpmPeriod * 0.5);
+      const maxP = Math.min(2.5, bpmPeriod * 2.0);
+      const clamped = Math.max(minP, Math.min(maxP, measured));
+      this.beatPeriod = this.beatPeriod * 0.8 + clamped * 0.2;
+      this.beatClock = 0;
+    } else if (dt > 0) {
+      // Slowly drift toward the current BPM estimate when beats are missing.
+      const relax = 1 - Math.exp(-dt * 0.5);
+      this.beatPeriod = this.beatPeriod + (bpmPeriod - this.beatPeriod) * relax;
+    }
+
+    // Cosine wave keeps continuity across phase wrap (no "flash" on reset).
+    const phase = this.beatPeriod > 0 ? this.beatClock / this.beatPeriod : 0;
+    const frac = phase - Math.floor(phase);
+    return clamp01(0.5 + 0.5 * Math.cos(frac * Math.PI * 2));
+  }
+
   private resizeToClientSize() {
     const canvas = this.context.canvas as HTMLCanvasElement;
-    const w = Math.max(1, Math.floor(canvas.clientWidth * devicePixelRatio));
-    const h = Math.max(1, Math.floor(canvas.clientHeight * devicePixelRatio));
+    const dpr = Math.min(devicePixelRatio, this.dprCap);
+    const w = Math.max(1, Math.floor(canvas.clientWidth * dpr));
+    const h = Math.max(1, Math.floor(canvas.clientHeight * dpr));
     if (canvas.width === w && canvas.height === h) return;
     canvas.width = w;
     canvas.height = h;
@@ -330,7 +374,8 @@ export class WebGpuRenderer {
   }) {
     const { time, dt, bpm, beat, dropPulse, vibe, nebulaVisible } = args;
 
-    const beatsPerChange = Math.max(2, Math.round(6 - vibe * 4));
+    const dropBoost = clamp01(dropPulse);
+    const beatsPerChange = Math.max(1, Math.round(6 - vibe * 4 - dropBoost * 2));
     if (!this.nebulaInitialized) {
       const init = this.randomNebulaTarget(vibe, 0.4);
       this.nebulaFrom.set(init);
@@ -355,19 +400,19 @@ export class WebGpuRenderer {
     this.prevDropPulse = dropPulse;
 
     const sinceLast = time - this.lastNebulaChange;
-    const fallbackInterval = 8 - vibe * 5; // seconds (3..8)
+    const fallbackInterval = (8 - vibe * 5) * (1 - dropBoost * 0.35); // seconds (~2..8)
 
     let trigger = false;
-    let punch = 0.5;
+    let punch = 0.4;
     if (nebulaVisible && dropOnset) {
       trigger = true;
       punch = 1.0;
     } else if (nebulaVisible && beatOnset && this.beatCount >= this.nextNebulaBeat) {
       trigger = true;
-      punch = 0.6 + 0.4 * vibe;
+      punch = 0.35 + 0.45 * vibe + 0.25 * dropBoost;
     } else if (nebulaVisible && sinceLast > fallbackInterval) {
       trigger = true;
-      punch = 0.45 + 0.35 * vibe;
+      punch = 0.3 + 0.35 * vibe + 0.15 * dropBoost;
     }
 
     if (trigger) {
@@ -375,7 +420,8 @@ export class WebGpuRenderer {
       this.nebulaTo.set(this.randomNebulaTarget(vibe, punch));
       this.nebulaMorph = 0;
       const beatSec = 60 / Math.max(1, bpm);
-      this.nebulaMorphDur = Math.max(0.25, beatSec * (1.6 - vibe * 0.7));
+      const baseDur = beatSec * (2.1 - vibe * 0.9);
+      this.nebulaMorphDur = Math.max(0.22, baseDur * (1 - dropBoost * 0.45));
       this.lastNebulaChange = time;
       this.nextNebulaBeat = this.beatCount + beatsPerChange;
     }
@@ -686,28 +732,39 @@ fn scene(mode: f32, uv: vec2<f32>, time: f32, bpm: f32, energy: f32, beat: f32, 
   } else {
     // Fractal Nebula (vibe-synced morphing)
     let sh = clamp(params.v3, vec4<f32>(0.0), vec4<f32>(1.0));
-    let detail = mix(0.85, 1.75, sh.x);
-    let warpMul = mix(0.4, 1.8, sh.y);
+    let detail = mix(0.9, 1.55, sh.x);
+    let warpMul = mix(0.45, 1.65, sh.y);
     let swirl = (sh.z * 2.0 - 1.0) * mix(0.08, 0.35, 0.6 * sh.y + 0.4 * sh.w);
     let structure = sh.w;
     let fold = smoothstep(0.15, 0.85, structure);
     let ridge = smoothstep(0.25, 1.0, structure);
 
-    let speed = (bpm / 60.0) * (0.12 + intensity * 0.4) * (1.0 + 0.25 * sh.y + 0.15 * abs(swirl));
-    let t = time * speed;
-    var q = vec3<f32>(uv * (1.1 + energy * 1.9) * detail, t);
+    let beatFlow = beat;
+    let drop = clamp(params.v2.y, 0.0, 1.0);
+    let beatK = beatFlow * 2.0 - 1.0;
+
+    let motionCoef = 0.05 + intensity * 0.25 + drop * 0.22;
+    let baseSpeed = (bpm / 60.0) * motionCoef * (1.0 + 0.2 * sh.y + 0.12 * abs(swirl));
+    let t = time * baseSpeed;
+    let beatOffset = beatFlow * (0.08 + intensity * 0.18 + drop * 0.55);
+    let tb = t + beatOffset;
+    let beatWarp = 1.0 + beatK * (0.06 + intensity * 0.1 + drop * 0.22);
+    let beatZoom = 1.0 + beatK * (0.012 + intensity * 0.03 + drop * 0.05);
+    let beatTwist = beatK * (0.25 + intensity * 0.5 + drop * 0.9);
+
+    var q = vec3<f32>(uv * (1.1 + energy * 1.9) * detail * beatZoom, tb);
     q.xy = mix(q.xy, abs(q.xy), fold);
     q = q + vec3<f32>(
-        sin(q.y * (1.15 + 0.55 * detail) + t * 0.12 + swirl * 2.2),
-        cos(q.x * (1.05 + 0.5 * detail) - t * 0.1 - swirl * 2.0),
+        sin(q.y * (1.15 + 0.55 * detail) + tb * 0.12 + swirl * 2.2 + beatTwist * 0.9),
+        cos(q.x * (1.05 + 0.5 * detail) - tb * 0.1 - swirl * 2.0 - beatTwist * 0.9),
         0.0
-      ) * (0.3 + intensity * 0.7) * warpMul;
+      ) * (0.24 + intensity * 0.76) * (1.0 + drop * 0.35) * warpMul * beatWarp;
     var acc = 0.0;
     var colAcc = vec3<f32>(0.0);
-    for (var i = 0u; i < 9u; i = i + 1u) {
+    for (var i = 0u; i < 8u; i = i + 1u) {
       let fi = f32(i);
       let s = (1.25 + fi * 0.38) * detail;
-      let tt = vec2<f32>(t * (0.22 + 0.18 * warpMul), -t * (0.19 + 0.16 * warpMul));
+      let tt = vec2<f32>(tb * (0.22 + 0.18 * warpMul), -tb * (0.19 + 0.16 * warpMul));
       let n = noise(q.xy * s + tt + vec2<f32>(structure * 2.7, swirl * 3.1));
       let dCenter = abs(n - 0.5);
       let dEdge = min(n, 1.0 - n);
@@ -715,18 +772,18 @@ fn scene(mode: f32, uv: vec2<f32>, time: f32, bpm: f32, energy: f32, beat: f32, 
       let w = exp(-d * (4.0 + high * 6.0 + ridge * 8.0));
       acc = acc + w;
       colAcc = colAcc + palette(n + fi * 0.06 + structure * 0.12) * w;
-      q.xy = rotate2(q.xy, 0.14 + n * 0.26 + swirl * 0.22);
+      q.xy = rotate2(q.xy, 0.14 + n * 0.26 + swirl * 0.22 + beatK * (0.02 + intensity * 0.05 + drop * 0.08));
       q.xy =
         q.xy +
         vec2<f32>(
-          sin(q.y * (0.9 + 0.4 * detail) - t * 0.35),
-          cos(q.x * (0.8 + 0.5 * detail) + t * 0.33)
+          sin(q.y * (0.9 + 0.4 * detail) - tb * 0.35),
+          cos(q.x * (0.8 + 0.5 * detail) + tb * 0.33)
         ) *
           (0.03 + 0.06 * warpMul) *
           (0.35 + 0.65 * ridge);
     }
     col = colAcc / max(0.001, acc);
-    col = col + beat * vec3<f32>(0.5, 0.7, 1.0) * (0.2 + intensity);
+    col = col + beatFlow * vec3<f32>(0.35, 0.5, 0.8) * (0.05 + 0.11 * intensity + 0.18 * drop);
   }
 
   return col;
@@ -763,7 +820,7 @@ fn fsMain(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
 
   // Drop flash / morph accent (subtle vignette + chroma lift)
   let vign = smoothstep(1.1, 0.2, length(uv));
-  col = col + dropPulse * vign * palette(0.92) * (0.08 + intensity * 0.18);
+  col = col + dropPulse * vign * palette(0.92) * (0.12 + intensity * 0.24);
 
   col = col * (0.55 + energy * 0.8);
   col = max(col, vec3<f32>(0.0));
