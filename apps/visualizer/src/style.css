@@ -83,6 +83,12 @@ canvas {
   border-radius: 999px;
   background: #ff4d6d;
 }
+.dot.warn {
+  background: #f59e0b;
+}
+.dot.demo {
+  background: var(--accent);
+}
 .dot.ok {
   background: #22c55e;
 }
@@ -161,4 +167,3 @@ button:disabled {
   gap: 10px;
   margin-top: 10px;
 }
-

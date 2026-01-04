@@ -28,6 +28,8 @@ export class Canvas2dRenderer {
 
   private palette: Palette | null = null;
   private texture: ImageBitmap | null = null;
+  private seed = 0;
+  private noisePattern: CanvasPattern | null = null;
 
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
@@ -42,6 +44,11 @@ export class Canvas2dRenderer {
 
   setPreset(preset: PresetSpec) {
     this.palette = preset.palette;
+  }
+
+  setSeed(seed: number) {
+    this.seed = seed | 0;
+    this.noisePattern = this.buildNoisePattern(this.seed);
   }
 
   async setTextureFromBase64Png(pngBase64: string) {
@@ -65,13 +72,17 @@ export class Canvas2dRenderer {
     const energy = clamp01(state.energy);
     const beat = clamp01(state.beat);
 
+    const seedPhase = ((this.seed >>> 0) % 10000) / 10000;
+    const cx = w * (0.45 + 0.12 * Math.sin(seedPhase * Math.PI * 2));
+    const cy = h * (0.52 + 0.1 * Math.cos(seedPhase * Math.PI * 2));
+
     // Background gradient
     const g = this.ctx.createRadialGradient(
-      w * 0.5,
-      h * 0.5,
+      cx,
+      cy,
       10,
-      w * 0.5,
-      h * 0.5,
+      cx,
+      cy,
       Math.max(w, h) * 0.7
     );
     g.addColorStop(0, toCssRgb(pal.b, 0.22 + energy * 0.25));
@@ -80,16 +91,29 @@ export class Canvas2dRenderer {
     this.ctx.fillStyle = g;
     this.ctx.fillRect(0, 0, w, h);
 
+    // Film-grain / grit (seeded) to avoid "flat gradient" look
+    if (this.noisePattern) {
+      this.ctx.save();
+      this.ctx.globalCompositeOperation = "overlay";
+      this.ctx.globalAlpha = 0.06 + energy * 0.06;
+      this.ctx.fillStyle = this.noisePattern;
+      this.ctx.translate(Math.sin(state.time * 0.7) * 40, Math.cos(state.time * 0.63) * 35);
+      this.ctx.fillRect(-80, -80, w + 160, h + 160);
+      this.ctx.restore();
+    }
+
     // Optional texture overlay
     if (this.texture) {
       const scale = 1.2 + energy * 0.6;
       const tw = this.texture.width * scale;
       const th = this.texture.height * scale;
-      const x = (w - tw) * 0.5 + Math.sin(state.time * 0.3) * 20;
-      const y = (h - th) * 0.5 + Math.cos(state.time * 0.27) * 20;
-      this.ctx.globalAlpha = 0.12 + energy * 0.18;
+      const x = (w - tw) * 0.5 + Math.sin(state.time * 0.22 + seedPhase * 6.0) * (28 + energy * 22);
+      const y = (h - th) * 0.5 + Math.cos(state.time * 0.2 - seedPhase * 5.0) * (26 + energy * 18);
+      this.ctx.globalCompositeOperation = "screen";
+      this.ctx.globalAlpha = 0.16 + energy * 0.26;
       this.ctx.drawImage(this.texture, x, y, tw, th);
       this.ctx.globalAlpha = 1;
+      this.ctx.globalCompositeOperation = "source-over";
     }
 
     // Spectrum bars
@@ -125,6 +149,32 @@ export class Canvas2dRenderer {
     }
   }
 
+  private buildNoisePattern(seed: number) {
+    const s = Math.max(1, seed | 0) >>> 0;
+    let t = s;
+    const rand = () => {
+      t += 0x6d2b79f5;
+      let r = Math.imul(t ^ (t >>> 15), 1 | t);
+      r ^= r + Math.imul(r ^ (r >>> 7), 61 | r);
+      return ((r ^ (r >>> 14)) >>> 0) / 4294967296;
+    };
+    const oc = document.createElement("canvas");
+    oc.width = 192;
+    oc.height = 192;
+    const octx = oc.getContext("2d");
+    if (!octx) return null;
+    const img = octx.createImageData(oc.width, oc.height);
+    for (let i = 0; i < img.data.length; i += 4) {
+      const v = Math.floor(rand() * 255);
+      img.data[i + 0] = v;
+      img.data[i + 1] = v;
+      img.data[i + 2] = v;
+      img.data[i + 3] = 255;
+    }
+    octx.putImageData(img, 0, 0);
+    return this.ctx.createPattern(oc, "repeat");
+  }
+
   private resizeToClientSize() {
     const w = Math.max(1, Math.floor(this.canvas.clientWidth * devicePixelRatio));
     const h = Math.max(1, Math.floor(this.canvas.clientHeight * devicePixelRatio));
@@ -133,4 +183,3 @@ export class Canvas2dRenderer {
     this.canvas.height = h;
   }
 }
-

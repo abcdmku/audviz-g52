@@ -87,6 +87,14 @@ export class AnalysisEngine {
   private bpm: number | null = null;
   private bpmConfidence = 0;
 
+  private shortEnergy = 0;
+  private longEnergy = 0;
+  private energyDelta = 0;
+  private lastSection: string | null = null;
+  private lastSectionAt = -999;
+  private lastDropAt = -999;
+  private lastBreakAt = -999;
+
   constructor(opts: EngineOptions) {
     this.onMessage = opts.onMessage;
   }
@@ -109,6 +117,13 @@ export class AnalysisEngine {
       this.bpmConfidence = 0;
       this.silence = true;
       this.silenceSince = 0;
+      this.shortEnergy = 0;
+      this.longEnergy = 0;
+      this.energyDelta = 0;
+      this.lastSection = null;
+      this.lastSectionAt = -999;
+      this.lastDropAt = -999;
+      this.lastBreakAt = -999;
     }
   }
 
@@ -156,6 +171,8 @@ export class AnalysisEngine {
       (this.energyEma - this.energyFloor) / (this.energyCeil - this.energyFloor)
     );
 
+    this.updateSectionHeuristics(t, energyNorm);
+
     const silenceNow = energyNorm < 0.03;
     if (silenceNow) {
       if (!this.silence) this.silenceSince = t;
@@ -194,6 +211,66 @@ export class AnalysisEngine {
       const bins = this.downsampleSpectrum(mag, this.cfg.spectrumBins);
       this.onMessage({ spectrum: bins });
     }
+  }
+
+  private updateSectionHeuristics(t: number, energy: number) {
+    // Short/long moving averages to detect "drop" style energy surges.
+    const shortA = 0.25;
+    const longA = 0.02;
+
+    const prevShort = this.shortEnergy;
+    this.shortEnergy = this.shortEnergy * (1 - shortA) + energy * shortA;
+    this.longEnergy = this.longEnergy * (1 - longA) + energy * longA;
+    this.energyDelta = this.shortEnergy - prevShort;
+
+    const cooldown = 2.5;
+    const sectionCooldown = 1.0;
+
+    const canEmit = t - this.lastSectionAt > sectionCooldown;
+
+    const isDrop =
+      canEmit &&
+      t - this.lastDropAt > cooldown &&
+      this.longEnergy < 0.42 &&
+      this.shortEnergy > 0.68 &&
+      this.energyDelta > 0.08;
+
+    const isBreak =
+      canEmit &&
+      t - this.lastBreakAt > cooldown &&
+      this.longEnergy > 0.55 &&
+      this.shortEnergy < 0.33 &&
+      this.energyDelta < -0.06;
+
+    if (isDrop) {
+      this.lastDropAt = t;
+      this.emitSection(t, "Drop");
+      return;
+    }
+
+    if (isBreak) {
+      this.lastBreakAt = t;
+      this.emitSection(t, "Break");
+      return;
+    }
+
+    // Build: sustained rise (helps drive pre-drop switching)
+    const build =
+      canEmit &&
+      this.longEnergy < 0.6 &&
+      this.shortEnergy > 0.45 &&
+      this.energyDelta > 0.02 &&
+      t - this.lastDropAt > 1.0;
+    if (build) {
+      this.emitSection(t, "Build");
+    }
+  }
+
+  private emitSection(t: number, section: string) {
+    if (this.lastSection === section) return;
+    this.lastSection = section;
+    this.lastSectionAt = t;
+    this.onMessage({ section });
   }
 
   private computeSpectrumAndFlux(frame: Float32Array) {

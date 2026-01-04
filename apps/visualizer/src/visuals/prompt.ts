@@ -39,7 +39,11 @@ export function mapPromptToPreset(prompt: string): {
   const p = prompt.toLowerCase();
 
   let presetId: PresetId = "plasma";
-  if (hasAny(p, ["tunnel", "warp", "speed", "cyber", "neon", "grid"])) presetId = "tunnel";
+  if (hasAny(p, ["cathedral", "raymarch", "warp field", "temple", "portal"])) presetId = "warp";
+  else if (hasAny(p, ["triangle", "triangles", "geometric", "shapes", "polygon"])) presetId = "strobeGeo";
+  else if (hasAny(p, ["grid", "strobe", "glitch", "scanlines", "tech"])) presetId = "strobeGrid";
+  else if (hasAny(p, ["nebula", "space", "cosmic", "starfield"])) presetId = "nebula";
+  else if (hasAny(p, ["tunnel", "warp", "speed", "cyber", "neon"])) presetId = "tunnel";
   else if (hasAny(p, ["kaleido", "kaleidoscope", "mandala", "symmetry"])) presetId = "kaleido";
 
   let palette: Palette | undefined;
@@ -51,4 +55,3 @@ export function mapPromptToPreset(prompt: string): {
   const texturePrompt = prompt.length > 2 ? prompt : undefined;
   return { presetId, palette, texturePrompt };
 }
-

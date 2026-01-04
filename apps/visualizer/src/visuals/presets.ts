@@ -1,4 +1,11 @@
-export type PresetId = "plasma" | "tunnel" | "kaleido";
+export type PresetId =
+  | "plasma"
+  | "tunnel"
+  | "kaleido"
+  | "warp"
+  | "strobeGrid"
+  | "strobeGeo"
+  | "nebula";
 
 export type Palette = {
   a: [number, number, number];
@@ -52,7 +59,55 @@ export const PRESETS: PresetSpec[] = [
     },
     texturePrompt: "psychedelic fractal texture, seamless"
   }
+  ,
+  {
+    id: "warp",
+    name: "Warp Cathedral",
+    mode: 3,
+    palette: {
+      a: [0.01, 0.02, 0.04],
+      b: [0.5, 0.95, 1.0],
+      c: [0.98, 0.45, 0.95],
+      d: [1.0, 0.92, 0.3]
+    },
+    texturePrompt: "high detail abstract texture, seamless"
+  },
+  {
+    id: "strobeGrid",
+    name: "Strobe Grid",
+    mode: 4,
+    palette: {
+      a: [0.02, 0.02, 0.02],
+      b: [0.95, 0.95, 1.0],
+      c: [0.1, 0.95, 0.85],
+      d: [1.0, 0.2, 0.7]
+    },
+    texturePrompt: "glitch grid texture, seamless"
+  },
+  {
+    id: "strobeGeo",
+    name: "Strobe Geometry",
+    mode: 4.25,
+    palette: {
+      a: [0.02, 0.02, 0.02],
+      b: [0.95, 0.95, 1.0],
+      c: [0.1, 0.95, 0.85],
+      d: [1.0, 0.2, 0.7]
+    },
+    texturePrompt: "geometric triangle pattern texture, seamless"
+  },
+  {
+    id: "nebula",
+    name: "Fractal Nebula",
+    mode: 5,
+    palette: {
+      a: [0.01, 0.02, 0.03],
+      b: [0.25, 0.85, 1.0],
+      c: [0.85, 0.35, 1.0],
+      d: [1.0, 0.55, 0.2]
+    },
+    texturePrompt: "space nebula texture, seamless"
+  }
 ];
 
 export const DEFAULT_PRESET_ID: PresetId = "tunnel";
-
