@@ -82,7 +82,8 @@ export class WebGl2Renderer {
 
   private program: WebGLProgram;
   private vao: WebGLVertexArrayObject;
-  private tex: WebGLTexture;
+  private texA: WebGLTexture;
+  private texB: WebGLTexture;
 
   private uRes: WebGLUniformLocation;
   private uTime: WebGLUniformLocation;
@@ -101,12 +102,26 @@ export class WebGl2Renderer {
   private uPalC: WebGLUniformLocation;
   private uPalD: WebGLUniformLocation;
   private uSpectrum0: WebGLUniformLocation;
+  private uUser: WebGLUniformLocation;
+  private uTexBlend: WebGLUniformLocation;
 
   private spectrum = new Float32Array(64);
 
   private preset: PresetSpec | null = null;
   private transitionState: TransitionState | null = null;
   private seed = Math.floor(Math.random() * 1_000_000_000);
+
+  private user = {
+    textureStrength: 0.8,
+    warpStrength: 0.85,
+    strobeStrength: 0.7,
+    brightness: 1,
+    grainStrength: 0.7
+  };
+
+  private texBlend = 0; // 0..1
+  private textureCrossfadeActive = false;
+  private textureCrossfadeSec = 0.75;
 
   // Nebula morph (vibe-synced fractal shape changes)
   private rngState = 1 >>> 0;
@@ -158,25 +173,29 @@ export class WebGl2Renderer {
     this.vao = vao;
     gl.bindVertexArray(this.vao);
 
-    const tex = gl.createTexture();
-    if (!tex) throw new Error("WebGL: createTexture failed");
-    this.tex = tex;
-    gl.bindTexture(gl.TEXTURE_2D, tex);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
-    gl.texImage2D(
-      gl.TEXTURE_2D,
-      0,
-      gl.RGBA,
-      1,
-      1,
-      0,
-      gl.RGBA,
-      gl.UNSIGNED_BYTE,
-      new Uint8Array([255, 255, 255, 255])
-    );
+    const initTex = () => {
+      const tex = gl.createTexture();
+      if (!tex) throw new Error("WebGL: createTexture failed");
+      gl.bindTexture(gl.TEXTURE_2D, tex);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
+      gl.texImage2D(
+        gl.TEXTURE_2D,
+        0,
+        gl.RGBA,
+        1,
+        1,
+        0,
+        gl.RGBA,
+        gl.UNSIGNED_BYTE,
+        new Uint8Array([255, 255, 255, 255])
+      );
+      return tex;
+    };
+    this.texA = initTex();
+    this.texB = initTex();
 
     gl.useProgram(this.program);
     const loc = (name: string) => {
@@ -201,10 +220,24 @@ export class WebGl2Renderer {
     this.uPalC = loc("uPalC");
     this.uPalD = loc("uPalD");
     this.uSpectrum0 = loc("uSpectrum[0]");
+    this.uUser = loc("uUser");
+    this.uTexBlend = loc("uTexBlend");
 
     const uTex = gl.getUniformLocation(this.program, "uTex");
     if (!uTex) throw new Error("WebGL missing uniform: uTex");
     gl.uniform1i(uTex, 0);
+    const uTex2 = gl.getUniformLocation(this.program, "uTex2");
+    if (!uTex2) throw new Error("WebGL missing uniform: uTex2");
+    gl.uniform1i(uTex2, 1);
+
+    gl.uniform1f(this.uTexBlend, 0);
+    gl.uniform4f(
+      this.uUser,
+      this.user.textureStrength,
+      this.user.warpStrength,
+      this.user.strobeStrength,
+      this.user.brightness
+    );
 
     gl.enable(gl.BLEND);
     gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
@@ -218,6 +251,28 @@ export class WebGl2Renderer {
     this.seed = ((seed | 0) >>> 0) % 1_000_000;
     this.rngState = (this.seed || 1) >>> 0;
     this.nebulaInitialized = false;
+  }
+
+  setUserParams(params: Record<string, number>) {
+    const n = (k: keyof typeof this.user) => {
+      const v = params[k];
+      return typeof v === "number" && Number.isFinite(v) ? v : this.user[k];
+    };
+    this.user.textureStrength = Math.max(0, Math.min(1, n("textureStrength")));
+    this.user.warpStrength = Math.max(0, Math.min(1, n("warpStrength")));
+    this.user.strobeStrength = Math.max(0, Math.min(1, n("strobeStrength")));
+    this.user.brightness = Math.max(0.25, Math.min(2, n("brightness")));
+    this.user.grainStrength = Math.max(0, Math.min(1, n("grainStrength")));
+
+    const gl = this.gl;
+    gl.useProgram(this.program);
+    gl.uniform4f(
+      this.uUser,
+      this.user.textureStrength,
+      this.user.warpStrength,
+      this.user.strobeStrength,
+      this.user.brightness
+    );
   }
 
   setPreset(preset: PresetSpec) {
@@ -244,15 +299,24 @@ export class WebGl2Renderer {
     this.applyPalette(palette);
   }
 
-  async setTextureFromBase64Png(pngBase64: string) {
-    const bin = Uint8Array.from(atob(pngBase64), (c) => c.charCodeAt(0));
-    const blob = new Blob([bin], { type: "image/png" });
+  async setTextureFromBlob(blob: Blob, opts?: { immediate?: boolean }) {
     const bmp = await createImageBitmap(blob);
 
     const gl = this.gl;
-    gl.bindTexture(gl.TEXTURE_2D, this.tex);
+    gl.bindTexture(gl.TEXTURE_2D, opts?.immediate ? this.texA : this.texB);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, bmp);
     gl.generateMipmap(gl.TEXTURE_2D);
+
+    this.texBlend = 0;
+    this.textureCrossfadeActive = !opts?.immediate;
+    gl.useProgram(this.program);
+    gl.uniform1f(this.uTexBlend, 0);
+  }
+
+  async setTextureFromBase64Png(pngBase64: string) {
+    const bin = Uint8Array.from(atob(pngBase64), (c) => c.charCodeAt(0));
+    const blob = new Blob([bin], { type: "image/png" });
+    await this.setTextureFromBlob(blob);
   }
 
   render(state: RenderState) {
@@ -279,6 +343,17 @@ export class WebGl2Renderer {
 
     const dt = this.lastTime ? Math.min(0.1, Math.max(0, state.time - this.lastTime)) : 0;
     this.lastTime = state.time;
+
+    if (this.textureCrossfadeActive) {
+      this.texBlend = Math.min(1, this.texBlend + (dt > 0 ? dt / this.textureCrossfadeSec : 0));
+      if (this.texBlend >= 1) {
+        const tmp = this.texA;
+        this.texA = this.texB;
+        this.texB = tmp;
+        this.texBlend = 0;
+        this.textureCrossfadeActive = false;
+      }
+    }
     const vibe = clamp01(0.55 * intensity + 0.25 * high + 0.2 * clamp01(state.energy));
     const beatPulse = clamp01(state.beat);
     const beatFlow = this.updateBeatFlow(dt, state.bpm, beatPulse);
@@ -301,7 +376,9 @@ export class WebGl2Renderer {
     gl.useProgram(this.program);
     gl.bindVertexArray(this.vao);
     gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, this.tex);
+    gl.bindTexture(gl.TEXTURE_2D, this.texA);
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, this.texB);
 
     gl.uniform2f(this.uRes, w, h);
     gl.uniform1f(this.uTime, state.time);
@@ -314,6 +391,7 @@ export class WebGl2Renderer {
     gl.uniform1f(this.uDropPulse, dropPulse);
     gl.uniform1f(this.uIntensity, intensity);
     gl.uniform1f(this.uSeed, this.seed);
+    gl.uniform1f(this.uTexBlend, this.textureCrossfadeActive ? this.texBlend : 0);
     gl.uniform4f(
       this.uNebula,
       this.nebulaShape[0] ?? 0.5,
@@ -506,6 +584,9 @@ uniform vec3 uPalC;
 uniform vec3 uPalD;
 
 uniform sampler2D uTex;
+uniform sampler2D uTex2;
+uniform float uTexBlend;
+uniform vec4 uUser; // (texStrength, warpStrength, strobeStrength, brightness)
 uniform float uSpectrum[64];
 
 vec3 palette(float t) {
@@ -578,8 +659,15 @@ float shapeSdf(int kind, vec2 p, float r) {
   }
 }
 
-vec3 scene(float mode, vec2 uv, float time, float bpm, float energy, float beat, vec3 texc, float low, float mid, float high, float intensity) {
+vec3 scene(float mode, vec2 uv, float time, float bpm, float energy, float beat, vec3 texc, vec3 texScreen, float low, float mid, float high, float intensity) {
   vec3 col = vec3(0.0);
+
+  if (mode >= 5.75) {
+    col = max(texScreen, vec3(0.0));
+    col *= (0.85 + energy * 0.35);
+    col += beat * palette(0.92) * (0.03 + 0.05 * intensity);
+    return col;
+  }
 
   if (mode < 0.5) {
     vec2 p = uv * (2.2 + energy * 1.8);
@@ -603,7 +691,7 @@ vec3 scene(float mode, vec2 uv, float time, float bpm, float energy, float beat,
     float k = rings * 0.65 + grid * 0.35 + energy * 0.2;
     col = palette(k + (low + high) * 0.25);
     col = mix(col, col * tex2 * 1.7, 0.52);
-    col = col + (texc - 0.5) * 0.25 * (0.3 + intensity);
+    col = col + (texc - 0.5) * 0.25 * (0.3 + intensity) * uUser.x;
     col = col + beat * vec3(1.2, 1.0, 0.4);
   } else if (mode < 2.5) {
     vec2 p = uv;
@@ -664,11 +752,11 @@ vec3 scene(float mode, vec2 uv, float time, float bpm, float energy, float beat,
       float gy = abs(fract(p.y + cos(t * 0.45) * 0.2) - 0.5);
       float g = 1.0 - smoothstep(0.46 - high * 0.1, 0.5, min(gx, gy));
       float stripes = smoothstep(0.9, 1.0, sin((p.y * 7.0 + t * 4.0) + sin(p.x * 2.0)) * 0.5 + 0.5);
-      float strobe = smoothstep(0.6, 1.0, beat + intensity * 0.25);
+      float strobe = smoothstep(0.6, 1.0, beat + intensity * 0.25) * uUser.z;
       float k = g * 0.75 + stripes * 0.25;
       col = palette(k + mid * 0.35);
       col = col * (0.25 + 1.6 * strobe);
-      col = col + (texc - 0.5) * 0.35 * (0.2 + intensity);
+      col = col + (texc - 0.5) * 0.35 * (0.2 + intensity) * uUser.x;
     } else {
       // Strobe Geometry (triangular background + beat-morphing shapes)
       float speed = (bpm / 60.0) * (0.22 + intensity * 0.9);
@@ -716,13 +804,13 @@ vec3 scene(float mode, vec2 uv, float time, float bpm, float energy, float beat,
       float outline = 1.0 - smoothstep(edge, edge * 3.2, abs(d));
 
       float frame = smoothstep(0.475 - high * 0.04, 0.5, max(abs(fu.x), abs(fu.y)));
-      float strobe = smoothstep(0.25, 1.0, pulse + intensity * 0.25);
+      float strobe = smoothstep(0.25, 1.0, pulse + intensity * 0.25) * uUser.z;
 
       float k = fract(facet * 0.85 + h2 * 0.35 + mid * 0.22 + time * 0.02);
       col = palette(k + mid * 0.2) * (0.06 + 0.22 * triLines);
       col = col + palette(k + 0.35 + high * 0.15) * (0.12 + 1.6 * strobe) * (outline * 0.95 + fill * 0.35);
       col = col + palette(k + 0.75) * (0.05 + 1.1 * strobe) * frame * (0.25 + 0.75 * triLines);
-      col = col + (texc - 0.5) * 0.25 * (0.2 + intensity);
+      col = col + (texc - 0.5) * 0.25 * (0.2 + intensity) * uUser.x;
     }
   } else {
     // Fractal Nebula (vibe-synced morphing)
@@ -793,7 +881,7 @@ void main() {
   float modeB = uModeB;
   float blend = clamp(uBlend, 0.0, 1.0);
   float dropPulse = clamp(uDropPulse, 0.0, 1.0);
-  float intensity = clamp(uIntensity, 0.0, 1.0);
+  float intensity = clamp(uIntensity, 0.0, 1.0) * mix(0.35, 1.25, clamp(uUser.y, 0.0, 1.0));
 
   vec2 uv0 = (gl_FragCoord.xy / res.xy) * 2.0 - 1.0;
   vec2 uv = vec2(uv0.x * (res.x / res.y), uv0.y);
@@ -803,16 +891,23 @@ void main() {
   float high = spectrumBand(28, 64);
 
   vec2 texUv = fract(uv * 0.12 + vec2(0.5, 0.5) + vec2(sin(time * 0.05), cos(time * 0.04)) * 0.05);
-  vec3 texc = texture(uTex, texUv).xyz;
+  vec3 texA = texture(uTex, texUv).xyz;
+  vec3 texB = texture(uTex2, texUv).xyz;
+  vec3 texTile = mix(texA, texB, clamp(uTexBlend, 0.0, 1.0));
 
-  vec3 colA = scene(modeA, uv, time, bpm, energy, beat, texc, low, mid, high, intensity);
-  vec3 colB = scene(modeB, uv, time, bpm, energy, beat, texc, low, mid, high, intensity);
+  vec2 screenUv = gl_FragCoord.xy / res.xy;
+  vec3 sA = texture(uTex, screenUv).xyz;
+  vec3 sB = texture(uTex2, screenUv).xyz;
+  vec3 texScreen = mix(sA, sB, clamp(uTexBlend, 0.0, 1.0));
+
+  vec3 colA = scene(modeA, uv, time, bpm, energy, beat, texTile, texScreen, low, mid, high, intensity);
+  vec3 colB = scene(modeB, uv, time, bpm, energy, beat, texTile, texScreen, low, mid, high, intensity);
   vec3 col = mix(colA, colB, blend);
 
   float vign = smoothstep(1.1, 0.2, length(uv));
   col += dropPulse * vign * palette(0.92) * (0.12 + intensity * 0.24);
 
-  col = col * (0.55 + energy * 0.8);
+  col = col * (0.55 + energy * 0.8) * uUser.w;
   col = max(col, vec3(0.0));
   col = pow(col, vec3(0.9));
   outColor = vec4(col, 1.0);

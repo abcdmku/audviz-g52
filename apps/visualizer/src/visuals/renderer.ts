@@ -26,16 +26,30 @@ export class WebGpuRenderer {
   private spectrumBuffer: GPUBuffer;
   private bindGroup: GPUBindGroup;
 
-  private params = new Float32Array(8 * 4); // 8 vec4s
+  private params = new Float32Array(10 * 4); // 10 vec4s
   private spectrum = new Float32Array(64);
 
-  private texture: GPUTexture;
+  private textureA: GPUTexture;
+  private textureB: GPUTexture;
   private sampler: GPUSampler;
-  private textureView: GPUTextureView;
+  private textureViewA: GPUTextureView;
+  private textureViewB: GPUTextureView;
+  private texBlend = 0; // 0..1
 
   private preset: PresetSpec | null = null;
   private transitionState: TransitionState | null = null;
   private seed = 0;
+
+  private user = {
+    textureStrength: 0.8,
+    warpStrength: 0.85,
+    strobeStrength: 0.7,
+    brightness: 1,
+    grainStrength: 0.7
+  };
+
+  private textureCrossfadeActive = false;
+  private textureCrossfadeSec = 0.75;
 
   // Nebula morph (vibe-synced fractal shape changes)
   private rngState = 1 >>> 0;
@@ -105,19 +119,32 @@ export class WebGpuRenderer {
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
     });
 
-    // 1x1 fallback texture
-    this.texture = device.createTexture({
+    // 1x1 fallback textures (for crossfade)
+    this.textureA = device.createTexture({
       size: [1, 1, 1],
       format: "rgba8unorm",
       usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST
     });
+    this.textureB = device.createTexture({
+      size: [1, 1, 1],
+      format: "rgba8unorm",
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST
+    });
+    const white = new Uint8Array([255, 255, 255, 255]);
     device.queue.writeTexture(
-      { texture: this.texture },
-      new Uint8Array([255, 255, 255, 255]),
+      { texture: this.textureA },
+      white,
       { bytesPerRow: 4 },
       { width: 1, height: 1 }
     );
-    this.textureView = this.texture.createView();
+    device.queue.writeTexture(
+      { texture: this.textureB },
+      white,
+      { bytesPerRow: 4 },
+      { width: 1, height: 1 }
+    );
+    this.textureViewA = this.textureA.createView();
+    this.textureViewB = this.textureB.createView();
     this.sampler = device.createSampler({
       magFilter: "linear",
       minFilter: "linear"
@@ -129,7 +156,8 @@ export class WebGpuRenderer {
         { binding: 0, resource: { buffer: this.paramsBuffer } },
         { binding: 1, resource: { buffer: this.spectrumBuffer } },
         { binding: 2, resource: this.sampler },
-        { binding: 3, resource: this.textureView }
+        { binding: 3, resource: this.textureViewA },
+        { binding: 4, resource: this.textureViewB }
       ]
     });
 
@@ -156,6 +184,18 @@ export class WebGpuRenderer {
     this.nebulaInitialized = false;
   }
 
+  setUserParams(params: Record<string, number>) {
+    const n = (k: keyof typeof this.user) => {
+      const v = params[k];
+      return typeof v === "number" && Number.isFinite(v) ? v : this.user[k];
+    };
+    this.user.textureStrength = Math.max(0, Math.min(1, n("textureStrength")));
+    this.user.warpStrength = Math.max(0, Math.min(1, n("warpStrength")));
+    this.user.strobeStrength = Math.max(0, Math.min(1, n("strobeStrength")));
+    this.user.brightness = Math.max(0.25, Math.min(2, n("brightness")));
+    this.user.grainStrength = Math.max(0, Math.min(1, n("grainStrength")));
+  }
+
   setTransition(a: PresetSpec, b: PresetSpec, blend: number, dropPulse: number) {
     const palette = mixPalette(a.palette, b.palette, blend);
     this.transitionState = {
@@ -168,9 +208,7 @@ export class WebGpuRenderer {
     this.applyPalette(palette);
   }
 
-  async setTextureFromBase64Png(pngBase64: string) {
-    const bin = Uint8Array.from(atob(pngBase64), (c) => c.charCodeAt(0));
-    const blob = new Blob([bin], { type: "image/png" });
+  async setTextureFromBlob(blob: Blob, opts?: { immediate?: boolean }) {
     const bmp = await createImageBitmap(blob);
     const tex = this.device.createTexture({
       size: [bmp.width, bmp.height, 1],
@@ -185,19 +223,38 @@ export class WebGpuRenderer {
       { texture: tex },
       { width: bmp.width, height: bmp.height }
     );
-    this.texture.destroy();
-    this.texture = tex;
-    this.textureView = tex.createView();
 
-    this.bindGroup = this.device.createBindGroup({
-      layout: this.pipeline.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: { buffer: this.paramsBuffer } },
-        { binding: 1, resource: { buffer: this.spectrumBuffer } },
-        { binding: 2, resource: this.sampler },
-        { binding: 3, resource: this.textureView }
-      ]
-    });
+    if (opts?.immediate) {
+      try {
+        this.textureA.destroy();
+      } catch {
+        // ignore
+      }
+      this.textureA = tex;
+      this.textureViewA = tex.createView();
+      this.texBlend = 0;
+      this.textureCrossfadeActive = false;
+      this.rebuildBindGroup();
+      return;
+    }
+
+    try {
+      this.textureB.destroy();
+    } catch {
+      // ignore
+    }
+    this.textureB = tex;
+    this.textureViewB = tex.createView();
+
+    this.texBlend = 0;
+    this.textureCrossfadeActive = true;
+    this.rebuildBindGroup();
+  }
+
+  async setTextureFromBase64Png(pngBase64: string) {
+    const bin = Uint8Array.from(atob(pngBase64), (c) => c.charCodeAt(0));
+    const blob = new Blob([bin], { type: "image/png" });
+    await this.setTextureFromBlob(blob);
   }
 
   render(state: RenderState) {
@@ -208,6 +265,8 @@ export class WebGpuRenderer {
     // v1: (bpm, energy, beat, modeB)
     // v2: (blend, dropPulse, intensity, seed)
     // v3: (nebulaShape.x, nebulaShape.y, nebulaShape.z, nebulaShape.w)
+    // v4: (texBlend, texStrength, warpStrength, strobeStrength)
+    // v5: (brightness, grainStrength, 0, 0)
     const modeA = this.transitionState?.modeA ?? this.preset?.mode ?? 0;
     const modeB = this.transitionState?.modeB ?? this.preset?.mode ?? 0;
     const nebulaVisible = modeA >= 4.5 || modeB >= 4.5;
@@ -240,6 +299,47 @@ export class WebGpuRenderer {
     // Nebula shape morphing follows the track's "vibe": denser/faster changes at high intensity.
     const dt = this.lastTime ? Math.min(0.1, Math.max(0, state.time - this.lastTime)) : 0;
     this.lastTime = state.time;
+
+    if (this.textureCrossfadeActive) {
+      this.texBlend = Math.min(1, this.texBlend + (dt > 0 ? dt / this.textureCrossfadeSec : 0));
+      if (this.texBlend >= 1) {
+        const oldA = this.textureA;
+        this.textureA = this.textureB;
+        this.textureViewA = this.textureViewB;
+        try {
+          oldA.destroy();
+        } catch {
+          // ignore
+        }
+
+        const tex = this.device.createTexture({
+          size: [1, 1, 1],
+          format: "rgba8unorm",
+          usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST
+        });
+        this.device.queue.writeTexture(
+          { texture: tex },
+          new Uint8Array([255, 255, 255, 255]),
+          { bytesPerRow: 4 },
+          { width: 1, height: 1 }
+        );
+        this.textureB = tex;
+        this.textureViewB = tex.createView();
+
+        this.texBlend = 0;
+        this.textureCrossfadeActive = false;
+        this.rebuildBindGroup();
+      }
+    }
+
+    this.params[16] = this.textureCrossfadeActive ? this.texBlend : 0;
+    this.params[17] = this.user.textureStrength;
+    this.params[18] = this.user.warpStrength;
+    this.params[19] = this.user.strobeStrength;
+    this.params[20] = this.user.brightness;
+    this.params[21] = this.user.grainStrength;
+    this.params[22] = 0;
+    this.params[23] = 0;
     const vibe = clamp01(0.55 * intensity + 0.25 * high + 0.2 * clamp01(state.energy));
     const beatPulse = clamp01(state.beat);
     const beatFlow = this.updateBeatFlow(dt, state.bpm, beatPulse);
@@ -326,6 +426,19 @@ export class WebGpuRenderer {
     });
   }
 
+  private rebuildBindGroup() {
+    this.bindGroup = this.device.createBindGroup({
+      layout: this.pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: this.paramsBuffer } },
+        { binding: 1, resource: { buffer: this.spectrumBuffer } },
+        { binding: 2, resource: this.sampler },
+        { binding: 3, resource: this.textureViewA },
+        { binding: 4, resource: this.textureViewB }
+      ]
+    });
+  }
+
   private applyPalette(palette: Palette) {
     const write = (offsetVec4: number, rgb: [number, number, number]) => {
       const i = offsetVec4 * 4;
@@ -334,10 +447,10 @@ export class WebGpuRenderer {
       this.params[i + 2] = rgb[2];
       this.params[i + 3] = 1;
     };
-    write(4, palette.a);
-    write(5, palette.b);
-    write(6, palette.c);
-    write(7, palette.d);
+    write(6, palette.a);
+    write(7, palette.b);
+    write(8, palette.c);
+    write(9, palette.d);
   }
 
   private rand01() {
@@ -465,21 +578,24 @@ export class WebGpuRenderer {
 }
 
 const wgsl = /* wgsl */ `
-struct Params {
-  v0: vec4<f32>, // (w,h,time,mode)
-  v1: vec4<f32>, // (bpm, energy, beat, _)
-  v2: vec4<f32>, // (blend, dropPulse, intensity, seed)
-  v3: vec4<f32>, // (nebulaShape0..3)
-  palA: vec4<f32>,
-  palB: vec4<f32>,
-  palC: vec4<f32>,
-  palD: vec4<f32>,
-};
+ struct Params {
+   v0: vec4<f32>, // (w,h,time,mode)
+   v1: vec4<f32>, // (bpm, energy, beat, _)
+   v2: vec4<f32>, // (blend, dropPulse, intensity, seed)
+   v3: vec4<f32>, // (nebulaShape0..3)
+   v4: vec4<f32>, // (texBlend, texStrength, warpStrength, strobeStrength)
+   v5: vec4<f32>, // (brightness, grainStrength, _, _)
+   palA: vec4<f32>,
+   palB: vec4<f32>,
+   palC: vec4<f32>,
+   palD: vec4<f32>,
+ };
 
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var<storage, read> spectrum: array<f32, 64>;
-@group(0) @binding(2) var samp: sampler;
-@group(0) @binding(3) var tex: texture_2d<f32>;
+ @group(0) @binding(2) var samp: sampler;
+ @group(0) @binding(3) var texA: texture_2d<f32>;
+ @group(0) @binding(4) var texB: texture_2d<f32>;
 
 @vertex
 fn vsMain(@builtin(vertex_index) idx: u32) -> @builtin(position) vec4<f32> {
@@ -497,6 +613,13 @@ fn palette(t: f32) -> vec3<f32> {
   let c = params.palC.xyz;
   let d = params.palD.xyz;
   return a + b * cos(6.28318 * (c * t + d));
+}
+
+fn sampleTex(uv: vec2<f32>) -> vec3<f32> {
+  let t = clamp(params.v4.x, 0.0, 1.0);
+  let a = textureSample(texA, samp, uv).xyz;
+  let b = textureSample(texB, samp, uv).xyz;
+  return mix(a, b, t);
 }
 
 fn hash21(p: vec2<f32>) -> f32 {
@@ -574,8 +697,15 @@ fn shapeSdf(kind: i32, p: vec2<f32>, r: f32) -> f32 {
   }
 }
 
-fn scene(mode: f32, uv: vec2<f32>, time: f32, bpm: f32, energy: f32, beat: f32, texc: vec3<f32>, low: f32, mid: f32, high: f32, intensity: f32) -> vec3<f32> {
+fn scene(mode: f32, uv: vec2<f32>, time: f32, bpm: f32, energy: f32, beat: f32, texc: vec3<f32>, texScreen: vec3<f32>, low: f32, mid: f32, high: f32, intensity: f32) -> vec3<f32> {
   var col = vec3<f32>(0.0);
+
+  if (mode >= 5.75) {
+    col = max(texScreen, vec3<f32>(0.0));
+    col = col * (0.85 + energy * 0.35);
+    col = col + beat * palette(0.92) * (0.03 + 0.05 * intensity);
+    return col;
+  }
 
   if (mode < 0.5) {
     // Plasma bloom (upgraded: domain warping + spectrum shimmer)
@@ -595,14 +725,14 @@ fn scene(mode: f32, uv: vec2<f32>, time: f32, bpm: f32, energy: f32, beat: f32, 
     let z = 1.0 / max(0.12, r);
     let wob = sin(t * 1.8 + z * 0.8) * (0.1 + intensity * 0.35);
     let w = vec2<f32>((a / 6.28318) + wob, z * 0.11 + t * 0.28);
-    let tex2 = textureSample(tex, samp, fract(w)).xyz;
+    let tex2 = sampleTex(fract(w));
     let rings = sin(z * (6.0 + mid * 10.0) + t * (5.0 + high * 8.0)) * 0.5 + 0.5;
     let grid = smoothstep(0.93, 1.0, sin((a * (8.0 + low * 10.0) + z * 2.0) + t * 2.0) * 0.5 + 0.5);
     let k = rings * 0.65 + grid * 0.35 + energy * 0.2;
     col = palette(k + (low + high) * 0.25);
     col = mix(col, col * tex2 * 1.7, 0.52);
     // micro chromatic wobble
-    col = col + (texc - 0.5) * 0.25 * (0.3 + intensity);
+    col = col + (texc - 0.5) * 0.25 * (0.3 + intensity) * params.v4.y;
     col = col + beat * vec3<f32>(1.2, 1.0, 0.4);
   } else if (mode < 2.5) {
     // Kaleidoscope (upgraded: deeper symmetry + texture folding)
@@ -616,7 +746,7 @@ fn scene(mode: f32, uv: vec2<f32>, time: f32, bpm: f32, energy: f32, beat: f32, 
     p = rotate2(p, sin(time * 0.35) * 0.15);
     p = p * (1.9 + energy * 2.2);
     let n = noise(p * 1.4 + vec2<f32>(-time * 0.4, time * 0.6));
-    let tex2 = textureSample(tex, samp, fract(p * 0.09 + 0.5)).xyz;
+    let tex2 = sampleTex(fract(p * 0.09 + 0.5));
     let k = 0.55 + 0.45 * sin((7.0 + high * 10.0) * rad - time * 2.0 + n * (2.5 + mid * 3.0));
     col = palette(k + (mid + high) * 0.22);
     col = mix(col, col * tex2 * 1.55, 0.48);
@@ -669,11 +799,11 @@ fn scene(mode: f32, uv: vec2<f32>, time: f32, bpm: f32, energy: f32, beat: f32, 
       let gy = abs(fract(p.y + cos(t * 0.45) * 0.2) - 0.5);
       let g = 1.0 - smoothstep(0.46 - high * 0.1, 0.5, min(gx, gy));
       let stripes = smoothstep(0.9, 1.0, sin((p.y * 7.0 + t * 4.0) + sin(p.x * 2.0)) * 0.5 + 0.5);
-      let strobe = smoothstep(0.6, 1.0, beat + intensity * 0.25);
+      let strobe = smoothstep(0.6, 1.0, beat + intensity * 0.25) * params.v4.w;
       let k = g * 0.75 + stripes * 0.25;
       col = palette(k + mid * 0.35);
       col = col * (0.25 + 1.6 * strobe);
-      col = col + (texc - 0.5) * 0.35 * (0.2 + intensity);
+      col = col + (texc - 0.5) * 0.35 * (0.2 + intensity) * params.v4.y;
     } else {
       // Strobe Geometry (triangular background + beat-morphing shapes)
       let speed = (bpm / 60.0) * (0.22 + intensity * 0.9);
@@ -721,13 +851,13 @@ fn scene(mode: f32, uv: vec2<f32>, time: f32, bpm: f32, energy: f32, beat: f32, 
       let outline = 1.0 - smoothstep(edge, edge * 3.2, abs(d));
 
       let frame = smoothstep(0.475 - high * 0.04, 0.5, max(abs(fu.x), abs(fu.y)));
-      let strobe = smoothstep(0.25, 1.0, pulse + intensity * 0.25);
+      let strobe = smoothstep(0.25, 1.0, pulse + intensity * 0.25) * params.v4.w;
 
       let k = fract(facet * 0.85 + h * 0.35 + mid * 0.22 + time * 0.02);
       col = palette(k + mid * 0.2) * (0.06 + 0.22 * triLines);
       col = col + palette(k + 0.35 + high * 0.15) * (0.12 + 1.6 * strobe) * (outline * 0.95 + fill * 0.35);
       col = col + palette(k + 0.75) * (0.05 + 1.1 * strobe) * frame * (0.25 + 0.75 * triLines);
-      col = col + (texc - 0.5) * 0.25 * (0.2 + intensity);
+      col = col + (texc - 0.5) * 0.25 * (0.2 + intensity) * params.v4.y;
     }
   } else {
     // Fractal Nebula (vibe-synced morphing)
@@ -800,7 +930,9 @@ fn fsMain(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
   let modeB = params.v1.w;
   let blend = clamp(params.v2.x, 0.0, 1.0);
   let dropPulse = clamp(params.v2.y, 0.0, 1.0);
-  let intensity = clamp(params.v2.z, 0.0, 1.0);
+  let warpStrength = clamp(params.v4.z, 0.0, 1.0);
+  let brightness = clamp(params.v5.x, 0.25, 2.0);
+  let intensity = clamp(params.v2.z, 0.0, 1.0) * mix(0.35, 1.25, warpStrength);
   // params.v2.w is a per-session seed used by the hash/noise functions.
   // params.v3 is a 0..1 vec4 controlling nebula shape morphing.
 
@@ -812,17 +944,18 @@ fn fsMain(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
   let high = spectrumBand(28u, 64u);
 
   let texUv = fract(uv * 0.12 + vec2<f32>(0.5, 0.5) + vec2<f32>(sin(time * 0.05), cos(time * 0.04)) * 0.05);
-  let texc = textureSample(tex, samp, texUv).xyz;
+  let texTile = sampleTex(texUv);
+  let texScreen = sampleTex(pos.xy / res.xy);
 
-  let colA = scene(modeA, uv, time, bpm, energy, beat, texc, low, mid, high, intensity);
-  let colB = scene(modeB, uv, time, bpm, energy, beat, texc, low, mid, high, intensity);
+  let colA = scene(modeA, uv, time, bpm, energy, beat, texTile, texScreen, low, mid, high, intensity);
+  let colB = scene(modeB, uv, time, bpm, energy, beat, texTile, texScreen, low, mid, high, intensity);
   var col = mix(colA, colB, blend);
 
   // Drop flash / morph accent (subtle vignette + chroma lift)
   let vign = smoothstep(1.1, 0.2, length(uv));
   col = col + dropPulse * vign * palette(0.92) * (0.12 + intensity * 0.24);
 
-  col = col * (0.55 + energy * 0.8);
+  col = col * (0.55 + energy * 0.8) * brightness;
   col = max(col, vec3<f32>(0.0));
   col = pow(col, vec3<f32>(0.9));
   return vec4<f32>(col, 1.0);

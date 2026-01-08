@@ -27,9 +27,21 @@ export class Canvas2dRenderer {
   private ro: ResizeObserver;
 
   private palette: Palette | null = null;
-  private texture: ImageBitmap | null = null;
+  private preset: PresetSpec | null = null;
+  private textureA: ImageBitmap | null = null;
+  private textureB: ImageBitmap | null = null;
+  private texBlend = 0; // 0..1
+  private lastTime = 0;
   private seed = 0;
   private noisePattern: CanvasPattern | null = null;
+
+  private user = {
+    textureStrength: 0.8,
+    warpStrength: 0.85,
+    strobeStrength: 0.7,
+    brightness: 1,
+    grainStrength: 0.7
+  };
 
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
@@ -43,6 +55,7 @@ export class Canvas2dRenderer {
   }
 
   setPreset(preset: PresetSpec) {
+    this.preset = preset;
     this.palette = preset.palette;
   }
 
@@ -51,10 +64,40 @@ export class Canvas2dRenderer {
     this.noisePattern = this.buildNoisePattern(this.seed);
   }
 
+  setUserParams(params: Record<string, number>) {
+    const n = (k: keyof typeof this.user) => {
+      const v = params[k];
+      return typeof v === "number" && Number.isFinite(v) ? v : this.user[k];
+    };
+    this.user.textureStrength = Math.max(0, Math.min(1, n("textureStrength")));
+    this.user.warpStrength = Math.max(0, Math.min(1, n("warpStrength")));
+    this.user.strobeStrength = Math.max(0, Math.min(1, n("strobeStrength")));
+    this.user.brightness = Math.max(0.25, Math.min(2, n("brightness")));
+    this.user.grainStrength = Math.max(0, Math.min(1, n("grainStrength")));
+  }
+
+  async setTextureFromBlob(blob: Blob, opts?: { immediate?: boolean }) {
+    const bmp = await createImageBitmap(blob);
+    if (opts?.immediate) {
+      this.textureA = bmp;
+      this.textureB = null;
+      this.texBlend = 0;
+      return;
+    }
+    if (!this.textureA) {
+      this.textureA = bmp;
+      this.textureB = null;
+      this.texBlend = 0;
+      return;
+    }
+    this.textureB = bmp;
+    this.texBlend = 0;
+  }
+
   async setTextureFromBase64Png(pngBase64: string) {
     const bin = Uint8Array.from(atob(pngBase64), (c) => c.charCodeAt(0));
     const blob = new Blob([bin], { type: "image/png" });
-    this.texture = await createImageBitmap(blob);
+    await this.setTextureFromBlob(blob);
   }
 
   render(state: RenderState) {
@@ -71,10 +114,26 @@ export class Canvas2dRenderer {
 
     const energy = clamp01(state.energy);
     const beat = clamp01(state.beat);
+    const bright = Math.max(0.25, Math.min(2, this.user.brightness));
+
+    const dt = this.lastTime ? Math.min(0.1, Math.max(0, state.time - this.lastTime)) : 0;
+    this.lastTime = state.time;
+
+    if (this.textureB) {
+      const fadeSec = 0.75;
+      this.texBlend = Math.min(1, this.texBlend + dt / fadeSec);
+      if (this.texBlend >= 1) {
+        this.textureA = this.textureB;
+        this.textureB = null;
+        this.texBlend = 0;
+      }
+    }
 
     const seedPhase = ((this.seed >>> 0) % 10000) / 10000;
     const cx = w * (0.45 + 0.12 * Math.sin(seedPhase * Math.PI * 2));
     const cy = h * (0.52 + 0.1 * Math.cos(seedPhase * Math.PI * 2));
+
+    const wantVideo = (this.preset?.mode ?? 0) >= 5.75;
 
     // Background gradient
     const g = this.ctx.createRadialGradient(
@@ -85,35 +144,72 @@ export class Canvas2dRenderer {
       cy,
       Math.max(w, h) * 0.7
     );
-    g.addColorStop(0, toCssRgb(pal.b, 0.22 + energy * 0.25));
-    g.addColorStop(0.5, toCssRgb(pal.c, 0.18 + energy * 0.15));
+    g.addColorStop(0, toCssRgb(pal.b, clamp01((0.22 + energy * 0.25) * bright)));
+    g.addColorStop(0.5, toCssRgb(pal.c, clamp01((0.18 + energy * 0.15) * bright)));
     g.addColorStop(1, toCssRgb(pal.a, 1));
     this.ctx.fillStyle = g;
     this.ctx.fillRect(0, 0, w, h);
+
+    if (wantVideo && this.textureA) {
+      this.ctx.save();
+      this.ctx.globalCompositeOperation = "source-over";
+      this.ctx.globalAlpha = 1;
+      const bmp = this.textureA;
+      const scale = Math.max(w / bmp.width, h / bmp.height);
+      const tw = bmp.width * scale;
+      const th = bmp.height * scale;
+      const x = (w - tw) * 0.5;
+      const y = (h - th) * 0.5;
+      this.ctx.drawImage(bmp, x, y, tw, th);
+      this.ctx.restore();
+    }
 
     // Film-grain / grit (seeded) to avoid "flat gradient" look
     if (this.noisePattern) {
       this.ctx.save();
       this.ctx.globalCompositeOperation = "overlay";
-      this.ctx.globalAlpha = 0.06 + energy * 0.06;
+      const grain = Math.max(0, Math.min(1, this.user.grainStrength));
+      this.ctx.globalAlpha = (0.06 + energy * 0.06) * grain;
       this.ctx.fillStyle = this.noisePattern;
-      this.ctx.translate(Math.sin(state.time * 0.7) * 40, Math.cos(state.time * 0.63) * 35);
+      const warp = Math.max(0, Math.min(1, this.user.warpStrength));
+      this.ctx.translate(
+        Math.sin(state.time * 0.7) * (20 + 20 * warp),
+        Math.cos(state.time * 0.63) * (18 + 17 * warp)
+      );
       this.ctx.fillRect(-80, -80, w + 160, h + 160);
       this.ctx.restore();
     }
 
     // Optional texture overlay
-    if (this.texture) {
+    const texStrength = Math.max(0, Math.min(1, this.user.textureStrength));
+    const warp = Math.max(0, Math.min(1, this.user.warpStrength));
+    const drawTex = (bmp: ImageBitmap, alpha: number) => {
       const scale = 1.2 + energy * 0.6;
-      const tw = this.texture.width * scale;
-      const th = this.texture.height * scale;
-      const x = (w - tw) * 0.5 + Math.sin(state.time * 0.22 + seedPhase * 6.0) * (28 + energy * 22);
-      const y = (h - th) * 0.5 + Math.cos(state.time * 0.2 - seedPhase * 5.0) * (26 + energy * 18);
+      const tw = bmp.width * scale;
+      const th = bmp.height * scale;
+      const x =
+        (w - tw) * 0.5 +
+        Math.sin(state.time * 0.22 + seedPhase * 6.0) * (14 + (14 + energy * 22) * warp);
+      const y =
+        (h - th) * 0.5 +
+        Math.cos(state.time * 0.2 - seedPhase * 5.0) * (13 + (13 + energy * 18) * warp);
       this.ctx.globalCompositeOperation = "screen";
-      this.ctx.globalAlpha = 0.16 + energy * 0.26;
-      this.ctx.drawImage(this.texture, x, y, tw, th);
+      this.ctx.globalAlpha = alpha;
+      this.ctx.drawImage(bmp, x, y, tw, th);
       this.ctx.globalAlpha = 1;
       this.ctx.globalCompositeOperation = "source-over";
+    };
+
+    if (this.textureA) {
+      const baseAlpha = (0.16 + energy * 0.26) * texStrength;
+      const b = this.textureB;
+      if (b) {
+        const t = clamp01(this.texBlend);
+        drawTex(this.textureA, baseAlpha * (1 - t));
+        drawTex(b, baseAlpha * t);
+      } else {
+        drawTex(this.textureA, baseAlpha);
+      }
     }
 
     // Spectrum bars
@@ -127,7 +223,7 @@ export class Canvas2dRenderer {
       const bh = v * (h * (0.22 + energy * 0.28));
       const x = i * barW;
       const c = i % 3 === 0 ? pal.b : i % 3 === 1 ? pal.d : pal.c;
-      this.ctx.fillStyle = toCssRgb(c, 0.22 + v * 0.4);
+      this.ctx.fillStyle = toCssRgb(c, clamp01((0.22 + v * 0.4) * bright));
       this.ctx.fillRect(x, baseY - bh, Math.max(1, barW - 1), bh);
     }
     this.ctx.restore();
@@ -143,7 +239,8 @@ export class Canvas2dRenderer {
         Math.max(w, h) * 0.65
       );
       vg.addColorStop(0, toCssRgb(pal.d, 0));
-      vg.addColorStop(1, toCssRgb(pal.d, 0.18 * beat));
+      const strobe = Math.max(0, Math.min(1, this.user.strobeStrength));
+      vg.addColorStop(1, toCssRgb(pal.d, clamp01(0.18 * beat * strobe * bright)));
       this.ctx.fillStyle = vg;
       this.ctx.fillRect(0, 0, w, h);
     }

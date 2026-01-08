@@ -167,3 +167,99 @@ button:disabled {
   gap: 10px;
   margin-top: 10px;
 }
+
+.aiHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin: 10px 0 6px;
+}
+
+.aiTitle {
+  font-size: 12px;
+  color: var(--muted);
+  font-weight: 650;
+}
+
+.aiChips {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.chat {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: rgba(0, 0, 0, 0.25);
+  padding: 8px;
+  max-height: 160px;
+  overflow: auto;
+}
+
+.chatMsg {
+  display: grid;
+  gap: 2px;
+  padding: 6px 6px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+.chatMsg:last-child {
+  border-bottom: none;
+}
+
+.chatRole {
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.chatMsg.user .chatRole {
+  color: rgba(124, 92, 255, 0.9);
+}
+.chatMsg.assistant .chatRole {
+  color: rgba(0, 212, 255, 0.85);
+}
+.chatMsg.system .chatRole {
+  color: rgba(245, 158, 11, 0.9);
+}
+
+.chatContent {
+  font-size: 12px;
+  color: var(--text);
+  white-space: pre-wrap;
+}
+
+.aiControls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: flex-end;
+  margin: 8px 0;
+}
+.aiControls > div {
+  flex: 1 1 160px;
+  min-width: 150px;
+}
+
+.planDetails {
+  margin: 8px 0 0;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 8px 10px;
+  background: rgba(0, 0, 0, 0.22);
+}
+.planDetails summary {
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--muted);
+}
+.planJson {
+  margin: 8px 0 0;
+  font-size: 11px;
+  color: var(--muted);
+  white-space: pre-wrap;
+  max-height: 160px;
+  overflow: auto;
+}

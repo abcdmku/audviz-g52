@@ -5,7 +5,8 @@ export type PresetId =
   | "warp"
   | "strobeGrid"
   | "strobeGeo"
-  | "nebula";
+  | "nebula"
+  | "aiVideo";
 
 export type Palette = {
   a: [number, number, number];
@@ -33,7 +34,7 @@ export const PRESETS: PresetSpec[] = [
       c: [0.49, 0.36, 1.0],
       d: [1.0, 0.31, 0.6]
     },
-    texturePrompt: "iridescent noise texture, seamless"
+    texturePrompt: "iridescent oil slick film texture, seamless"
   },
   {
     id: "tunnel",
@@ -107,6 +108,17 @@ export const PRESETS: PresetSpec[] = [
       d: [1.0, 0.55, 0.2]
     },
     texturePrompt: "space nebula texture, seamless"
+  },
+  {
+    id: "aiVideo",
+    name: "AI Video (experimental)",
+    mode: 6,
+    palette: {
+      a: [0.02, 0.02, 0.02],
+      b: [0.1, 0.85, 1.0],
+      c: [0.85, 0.35, 1.0],
+      d: [1.0, 0.75, 0.2]
+    }
   }
 ];
 
